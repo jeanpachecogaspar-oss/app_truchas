@@ -1,0 +1,142 @@
+rules_version = '2';
+
+// Reglas de seguridad de SIPPT (4.º incremento).
+//
+// Dos capas, como el middleware y las validaciones de la API Laravel:
+//   1. QUIÉN: cada rol solo escribe lo que le corresponde (todos leen).
+//   2. QUÉ:   cada escritura se valida (campos permitidos, tipos y rangos),
+//             así un cliente modificado no puede guardar basura ni falsear
+//             autoría (OWASP A01 Control de acceso, A03 Inyección/validación).
+//
+// Riesgo conocido y aceptado para la demo: el rol se elige al registrarse.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Utilidades ──────────────────────────────────────────────────────
+    function autenticado() {
+      return request.auth != null;
+    }
+
+    function rol() {
+      return get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.rol;
+    }
+
+    function esTecnico() {
+      return autenticado() && rol() == 'tecnico';
+    }
+
+    // HU-05: el veterinario diagnostica, pero no ejecuta la intervención.
+    function puedeAtender() {
+      return autenticado() && rol() in ['operador', 'tecnico'];
+    }
+
+    function datos() {
+      return request.resource.data;
+    }
+
+    function cambia() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    function textoEntre(v, min, max) {
+      return v is string && v.size() >= min && v.size() <= max;
+    }
+
+    function parametroValido(p) {
+      return p in ['od_mgl', 'temp_c', 'ph'];
+    }
+
+    // RF-04: rango físico de cada sensor.
+    function valorFisico(p, v) {
+      return v is number
+        && ((p == 'od_mgl' && v >= 0 && v <= 20)
+         || (p == 'temp_c' && v >= -5 && v <= 40)
+         || (p == 'ph' && v >= 0 && v <= 14));
+    }
+
+    // ── Usuarios ────────────────────────────────────────────────────────
+    match /usuarios/{uid} {
+      allow read: if autenticado();
+      // Cada uno crea solo SU perfil, con su propio correo y un rol válido.
+      allow create: if autenticado()
+        && request.auth.uid == uid
+        && datos().keys().hasOnly(['nombre', 'email', 'rol', 'creado_en'])
+        && textoEntre(datos().nombre, 1, 80)
+        && datos().email == request.auth.token.email
+        && datos().rol in ['operador', 'tecnico', 'veterinario'];
+      // Nadie se cambia el rol desde la app (se hace en la consola).
+      allow update, delete: if false;
+    }
+
+    // ── Estanques (HU-01) ───────────────────────────────────────────────
+    function estanqueValido(id) {
+      return datos().codigo == id
+        && datos().codigo.matches('^[A-Z0-9][A-Z0-9_-]{0,19}$')
+        && datos().volumen_m3 is number && datos().volumen_m3 > 0 && datos().volumen_m3 <= 100000
+        && datos().biomasa_kg is number && datos().biomasa_kg >= 0 && datos().biomasa_kg <= 1000000
+        && datos().etapa in ['alevino', 'juvenil', 'engorde', 'cosecha']
+        && datos().umbrales is map
+        && datos().umbrales.keys().hasOnly(['od_mgl', 'temp_c', 'ph']);
+    }
+
+    match /estanques/{estanqueId} {
+      allow read: if autenticado();
+
+      allow create: if esTecnico()
+        && estanqueValido(estanqueId)
+        && datos().creado_por == request.auth.uid; // RNF-04: autoría real
+
+      allow update: if
+        // El técnico edita, pero el código (la identidad) no cambia.
+        (esTecnico() && estanqueValido(estanqueId) && datos().codigo == resource.data.codigo)
+        // Al atender una alerta, el operador solo puede tocar «alertas_abiertas».
+        || (puedeAtender() && cambia().hasOnly(['alertas_abiertas']));
+
+      allow delete: if esTecnico();
+
+      // HU-02: lecturas. Solo se agregan; una medición no se edita ni se borra.
+      match /series/{parametro}/lecturas/{lecturaId} {
+        allow read: if autenticado();
+        allow create: if esTecnico()
+          && parametroValido(parametro)
+          && datos().keys().hasOnly(['valor', 'medido_en', 'registrado_por'])
+          && valorFisico(parametro, datos().valor)
+          && datos().medido_en is timestamp
+          && datos().medido_en <= request.time + duration.value(5, 'm')
+          && datos().registrado_por == request.auth.uid;
+        allow update, delete: if false;
+      }
+    }
+
+    // ── Alertas (HU-04 / HU-05) ─────────────────────────────────────────
+    match /alertas/{alertaId} {
+      allow read: if autenticado();
+
+      allow create: if esTecnico()
+        && parametroValido(datos().parametro)
+        && datos().severidad in ['advertencia', 'critica']
+        && datos().estado in ['abierta', 'atendida']
+        && datos().valor_detectado is number
+        && datos().umbral_violado is number
+        && textoEntre(datos().estanque_id, 1, 20);
+
+      allow update: if
+        // El técnico (y su simulador) actualiza el último valor o la severidad.
+        (esTecnico()
+          && datos().parametro == resource.data.parametro
+          && datos().estanque_id == resource.data.estanque_id)
+        // Cerrar con atención: solo de «abierta» a «atendida», una sola vez,
+        // firmada por quien la registra y con una acción de largo razonable.
+        || (puedeAtender()
+          && resource.data.estado == 'abierta'
+          && datos().estado == 'atendida'
+          && cambia().hasOnly(['estado', 'atencion', 'actualizada_en'])
+          && datos().atencion.usuario_id == request.auth.uid
+          && textoEntre(datos().atencion.accion, 1, 80)
+          && (datos().atencion.observacion == null || textoEntre(datos().atencion.observacion, 0, 500)));
+
+      // El historial de alertas no se borra (trazabilidad).
+      allow delete: if false;
+    }
+  }
+}

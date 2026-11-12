@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Fondo del arranque nativo: el mismo azul profundo de la bienvenida, sin destello blanco. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <color android:color="#041C2B" />
+    </item>
+</layer-list>
